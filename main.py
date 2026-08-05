@@ -53,7 +53,7 @@ DB_NAME     = os.environ.get("MONGO_DB_NAME", "reqbot")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT        = int(os.environ.get("PORT", "8080"))
 
-MAX_REQUESTS = 100
+MAX_REQUESTS = 10000
 MAX_SECONDS  = 3600
 
 # ---------------------------------------------------------------------------
