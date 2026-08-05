@@ -16,7 +16,7 @@ services:
       - key: SELF_PING_INTERVAL_SECONDS
         value: "600"
       - key: MAX_REQUESTS_PER_JOB
-        value: "10"
+        value: "10000"
       - key: MAX_WINDOW_SECONDS
         value: "3600"
       - key: PYTHON_VERSION
