@@ -77,7 +77,7 @@ SELF_PING_INTERVAL_SECONDS = int(os.environ.get("SELF_PING_INTERVAL_SECONDS", "6
 
 # Guardrails on user-requested jobs, so this stays a keepalive tool and
 # not an accidental load generator / flooding tool.
-MAX_REQUESTS_PER_JOB = int(os.environ.get("MAX_REQUESTS_PER_JOB", "10000"))
+MAX_REQUESTS_PER_JOB = int(os.environ.get("MAX_REQUESTS_PER_JOB", "100"))
 MAX_WINDOW_SECONDS = int(os.environ.get("MAX_WINDOW_SECONDS", "3600"))  # 1 hour
 REQUEST_TIMEOUT_SECONDS = 10
 
