@@ -59,7 +59,7 @@ DB_NAME      = os.environ.get("MONGO_DB_NAME", "reqbot")
 WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "")
 PORT         = int(os.environ.get("PORT", "8080"))
 
-MAX_REQUESTS = 100
+MAX_REQUESTS = 10000
 MAX_SECONDS  = 3600
 
 # ---------------------------------------------------------------------------
@@ -174,7 +174,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send me a *URL* or *IPv4 address* and I'll hammer it with requests.\n\n"
         "📌 *Steps:*\n"
         "1️⃣ Send a URL or IPv4 address\n"
-        "2️⃣ Enter request count _(1 – 100)_\n"
+        "2️⃣ Enter request count _(1 – 10000)_\n"
         "3️⃣ Enter total duration in seconds _(1 – 3600)_\n"
         "4️⃣ Tap *▶ Start Sending*\n"
         "5️⃣ Tap *📊 Refresh Stats* any time\n\n"
