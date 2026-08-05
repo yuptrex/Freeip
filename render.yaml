@@ -10,12 +10,12 @@ services:
       - key: PYTHON_VERSION
         value: 3.12.7
       - key: BOT_TOKEN
-        sync: false          # set manually in Render dashboard
+        sync: false          # set in Render dashboard
       - key: MONGO_URI
-        sync: false          # set manually in Render dashboard
+        sync: false          # set in Render dashboard
       - key: MONGO_DB_NAME
         value: reqbot
       - key: WEBHOOK_URL
-        sync: false          # set to your https://<name>.onrender.com URL
+        sync: false          # set to your https://<name>.onrender.com
       - key: PORT
         value: 8080
