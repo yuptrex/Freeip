@@ -1,8 +1,9 @@
 services:
-  - type: worker
+  - type: web
     name: slow-bot
     runtime: python
     plan: free
+    healthCheckPath: /health
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
@@ -18,3 +19,5 @@ services:
         value: "80"
       - key: DEFAULT_CONN
         value: "250"
+      - key: PING_INTERVAL
+        value: "600"
