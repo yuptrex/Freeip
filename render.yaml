@@ -1,23 +1,23 @@
 services:
   - type: web
-    name: slow-bot
-    runtime: python
+    name: pinger-bot
+    env: python
     plan: free
-    healthCheckPath: /health
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python bot.py
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: MONGO_URI
+      - key: BASE_URL
         sync: false
-      - key: MONGO_DB
-        value: slowbot
-      - key: OWNER_IDS
+      - key: WEBHOOK_URL
         sync: false
-      - key: DEFAULT_PORT
-        value: "80"
-      - key: DEFAULT_CONN
-        value: "250"
-      - key: PING_INTERVAL
+      - key: SELF_PING_INTERVAL_SECONDS
         value: "600"
+      - key: MAX_REQUESTS_PER_JOB
+        value: "10"
+      - key: MAX_WINDOW_SECONDS
+        value: "3600"
+      - key: PYTHON_VERSION
+        value: 3.11.9
