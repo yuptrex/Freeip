@@ -1,23 +1,16 @@
 services:
   - type: web
-    name: pinger-bot
-    env: python
+    name: telegram-request-bot
+    env: node
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    healthCheckPath: /health
+    buildCommand: npm install
+    startCommand: npm start
     envVars:
       - key: BOT_TOKEN
-        sync: false
-      - key: BASE_URL
+        sync: false          # set manually in Render dashboard
+      - key: MONGODB_URI
         sync: false
       - key: WEBHOOK_URL
         sync: false
-      - key: SELF_PING_INTERVAL_SECONDS
-        value: "600"
-      - key: MAX_REQUESTS_PER_JOB
-        value: "10000"
-      - key: MAX_WINDOW_SECONDS
-        value: "3600"
-      - key: PYTHON_VERSION
-        value: 3.11.9
+      - key: NODE_ENV
+        value: production

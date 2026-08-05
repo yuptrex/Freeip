@@ -1,81 +1,174 @@
-# Keepalive Ping Bot
+# 🤖 Telegram HTTP Request Bot
 
-A Telegram bot for keeping your own server/service warm. Instead of one
-command with arguments, it asks you three questions one at a time:
+Send HTTP requests to any URL or IPv4 address via Telegram. Tracks sent/errors in real-time with an inline Stats button.
+
+---
+
+## ✨ Features
+
+- ✅ Accepts URLs **and** raw IPv4 addresses (e.g. `192.168.1.1:8080/path`)
+- ✅ Up to **100 requests**, spaced up to **3600 seconds** apart
+- ✅ Inline **Start Sending** button
+- ✅ Inline **Stats** button → shows sent, errors, remaining, progress bar
+- ✅ Completion notification when all requests finish
+- ✅ **MongoDB** stores sessions & jobs (survives restarts)
+- ✅ **Webhook** mode (no polling)
+- ✅ **Self-ping every 10 minutes** to prevent Render cold starts
+
+---
+
+## 🚀 Deployment Guide
+
+### 1. Create a Telegram Bot
+
+1. Open [@BotFather](https://t.me/BotFather) on Telegram
+2. Send `/newbot` and follow prompts
+3. Copy the **BOT_TOKEN**
+
+---
+
+### 2. Set up MongoDB Atlas (free tier)
+
+1. Go to [cloud.mongodb.com](https://cloud.mongodb.com) → create free cluster
+2. Create a database user (username + password)
+3. Whitelist IP `0.0.0.0/0` (allow all — required for Render)
+4. Click **Connect → Drivers** → copy the connection string
+5. Replace `<password>` with your DB user's password
+6. Your URI looks like:
+   ```
+   mongodb+srv://myuser:mypassword@cluster0.abcde.mongodb.net/requestbot?retryWrites=true&w=majority
+   ```
+
+---
+
+### 3. Push to GitHub
+
+```bash
+git init
+git add .
+git commit -m "initial commit"
+gh repo create telegram-request-bot --public --push
+# or: git remote add origin https://github.com/YOU/telegram-request-bot.git && git push -u origin main
+```
+
+---
+
+### 4. Deploy on Render
+
+1. Go to [render.com](https://render.com) → **New → Web Service**
+2. Connect your GitHub repo
+3. Settings:
+   - **Build Command:** `npm install`
+   - **Start Command:** `npm start`
+   - **Plan:** Free
+4. Add **Environment Variables** (in Render dashboard → Environment tab):
+
+| Key | Value |
+|-----|-------|
+| `BOT_TOKEN` | your Telegram bot token |
+| `MONGODB_URI` | your MongoDB Atlas URI |
+| `WEBHOOK_URL` | `https://your-app-name.onrender.com` |
+
+5. Click **Deploy** — wait for "Live" status
+6. Copy your Render URL (e.g. `https://telegram-request-bot.onrender.com`)
+7. Update `WEBHOOK_URL` env var with the exact Render URL
+
+---
+
+### 5. Register the Webhook
+
+After deploy, open in browser or run:
+
+```bash
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://your-app.onrender.com/bot<BOT_TOKEN>"
+```
+
+Expected response:
+```json
+{"ok":true,"result":true,"description":"Webhook was set"}
+```
+
+✅ Done! Your bot is live.
+
+---
+
+## 💬 Bot Usage Flow
 
 ```
-You:  /start
-Bot:  📡 Send me the link or IPv4 address you want to keep alive.
-You:  https://myapp.onrender.com
-Bot:  How many requests should I send?
-You:  50
-Bot:  Over how many seconds should those be spread?
-You:  10
-Bot:  📡 Sending 50 request(s) to https://myapp.onrender.com/ over 10s…
-Bot:  ✅ Done — sent 50 request(s) ... [per-request results]
+User:  https://example.com           (or 1.2.3.4:8080)
+Bot:   ✅ Target set. How many requests? (max 100)
+
+User:  50
+Bot:   ✅ Requests: 50. Interval in seconds? (max 3600)
+
+User:  5
+Bot:   📋 Summary ... [🚀 Start Sending]
+
+User clicks: 🚀 Start Sending
+Bot:   🚀 Sending started!   [📊 Stats]
+
+User clicks: 📊 Stats
+Bot:   📊 Job Stats
+       ██████░░░░ 60%
+       ✅ Sent: 30
+       ❌ Errors: 0
+       ⏳ Remaining: 20
+       ...
+
+Bot (auto): 🎉 All done! ██████████ 100% ...
 ```
 
-The bot spaces the requests evenly across the window you gave it, sends
-them, and reports the result of each, then stops.
+---
 
-A bare IPv4 address (e.g. `203.0.113.10`) is pinged over plain HTTP on
-port 80 by default (`http://203.0.113.10/`).
+## 📁 Project Structure
 
-`/cancel` abandons a conversation in progress. Only one job runs per chat
-at a time — start a new one (`/start`) once the current one finishes.
+```
+telegram-request-bot/
+├── bot.js              # Main bot logic
+├── models/
+│   ├── Session.js      # Per-user conversation state
+│   └── Job.js          # Request job tracking
+├── package.json
+├── render.yaml         # Render deployment config
+├── .env.example        # Environment variable template
+├── .gitignore
+└── README.md
+```
 
-## Limits
+---
 
-To keep this a lightweight keepalive tool rather than a load generator:
+## 🔧 Local Development
 
-| Limit | Default | Env var |
-|---|---|---|
-| Max requests per job | 100 | `MAX_REQUESTS_PER_JOB` |
-| Max window (seconds) | 3600 (1 hour) | `MAX_WINDOW_SECONDS` |
+```bash
+npm install
+cp .env.example .env
+# fill in .env values
 
-Adjust these in Render's environment variables if you need a different
-ceiling.
+# For local dev, use ngrok to expose localhost:
+npx ngrok http 3000
+# Then set WEBHOOK_URL=https://xxxx.ngrok.io in .env
 
-## Architecture
+npm run dev
+```
 
-Single aiohttp server on one Render Web Service. Telegram delivers
-updates via webhook (`/webhook/<BOT_TOKEN>`) rather than polling, since
-polling can silently die in the background while the web server still
-answers health checks.
+---
 
-- `GET /health` — health check, also used by the bot's own self-ping loop
-- `POST /webhook/<BOT_TOKEN>` — Telegram webhook endpoint
+## ⚙️ Environment Variables
 
-A background task pings the service's own `/health` every 10 minutes
-(`SELF_PING_INTERVAL_SECONDS`) so Render's free tier doesn't spin this
-bot itself down between uses. This is separate from — and doesn't
-interact with — the ping jobs you request via chat.
+| Variable | Description |
+|----------|-------------|
+| `BOT_TOKEN` | Telegram bot token from BotFather |
+| `MONGODB_URI` | MongoDB Atlas connection string |
+| `WEBHOOK_URL` | Public HTTPS URL of your Render service |
+| `PORT` | Port (Render sets this automatically) |
 
-## Environment variables
+---
 
-| Variable | Required | Description |
-|---|---|---|
-| `BOT_TOKEN` | Yes | Your bot token from [@BotFather](https://t.me/BotFather) |
-| `BASE_URL` | Yes | Public URL of this deployed service, e.g. `https://pinger-bot.onrender.com` — no trailing slash |
-| `WEBHOOK_URL` | No | Defaults to `BASE_URL` |
-| `SELF_PING_INTERVAL_SECONDS` | No | Default `600` (10 min) |
-| `MAX_REQUESTS_PER_JOB` | No | Default `100` |
-| `MAX_WINDOW_SECONDS` | No | Default `3600` |
-| `PORT` | No | Render sets this automatically |
+## 🛡️ Limits
 
-See `.env.example` for local development.
-
-## Deploying to Render
-
-1. Push this project to a GitHub repo.
-2. On Render: **New → Web Service** → connect the repo (or **New →
-   Blueprint** to pick up `render.yaml` automatically).
-   - Environment: **Python 3**
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `python bot.py`
-3. Add `BOT_TOKEN`. Leave `BASE_URL` as a placeholder for the first
-   deploy — Render assigns your `.onrender.com` URL during that deploy.
-4. Once deployed, copy the exact URL from the service dashboard, set it
-   as `BASE_URL` (no trailing slash), and redeploy. This also registers
-   the Telegram webhook automatically on startup.
-5. Message your bot with `/start` on Telegram to test.
+| Setting | Limit |
+|---------|-------|
+| Max requests | 100 |
+| Max interval | 3600 seconds (1 hour) |
+| Request timeout | 10 seconds per request |
+| Self-ping interval | Every 10 minutes |
