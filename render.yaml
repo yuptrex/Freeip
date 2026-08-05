@@ -1,16 +1,21 @@
 services:
   - type: web
-    name: telegram-request-bot
-    env: node
+    name: tg-request-bot
+    env: python
     plan: free
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
       - key: BOT_TOKEN
         sync: false          # set manually in Render dashboard
-      - key: MONGODB_URI
-        sync: false
+      - key: MONGO_URI
+        sync: false          # set manually in Render dashboard
+      - key: MONGO_DB_NAME
+        value: reqbot
       - key: WEBHOOK_URL
-        sync: false
-      - key: NODE_ENV
-        value: production
+        sync: false          # set to your https://<name>.onrender.com URL
+      - key: PORT
+        value: 8080
