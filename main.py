@@ -537,7 +537,7 @@ def _ssl_for_attempt(attempt: int) -> bool | ssl.SSLContext:
 # Core request function  — GET or POST, with proxy + SSL logic
 # ---------------------------------------------------------------------------
 
-_CONCURRENCY   = 500
+_CONCURRENCY   = 500000
 _MAX_RETRIES   = 5
 _RETRY_DELAYS  = [0.05, 0.1, 0.25, 0.5, 1.0]
 _CONNECT_TIMEOUT = 8
